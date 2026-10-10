@@ -373,6 +373,7 @@ def write_status_state(data: dict) -> None:
             "current_execution_start",
             "current_start_tokens",
             "last_state",
+            "active_subagents_count",
         ):
             if k in old_state:
                 state[k] = old_state[k]
@@ -530,10 +531,14 @@ def format_session_time(sec: float) -> str:
     return f"{hours}h{mins_rem:02d}m"
 
 
-def format_model_time(sec: float, is_working: bool = False) -> str:
+def format_model_time(sec: float, is_working: bool = False, active_subs: int = 0) -> str:
     sec = safe_float(sec, 0.0)
     if is_working:
-        return f"⏱️ {sec:.1f}s"
+        sub_badge = ""
+        if active_subs > 0:
+            badge_text = f"({active_subs} sub)" if active_subs == 1 else f"({active_subs} subs)"
+            sub_badge = f" {MAGENTA}{badge_text}{CYAN}"
+        return f"⏱️ {sec:.1f}s{sub_badge}"
     if sec <= 0:
         return "-"
     if sec < 60:
@@ -549,6 +554,60 @@ def format_tps(tps: float) -> str:
     return f"{tps:.0f} t/s" if tps >= 10 else f"{tps:.1f} t/s"
 
 
+def check_activity(data: dict) -> tuple[bool, int]:
+    """
+    检查系统是否处于活跃干活状态（主会话在工作，或有 subagent 在运行，或有后台任务）。
+    返回: (is_active: bool, active_subagents_count: int)
+    """
+    if not isinstance(data, dict):
+        return False, 0
+
+    curr_state = str(data.get("agent_state") or data.get("last_state") or "idle").strip().lower()
+
+    # 1. 提取活跃子智能体
+    active_subs = 0
+    subagents = data.get("subagents")
+    if isinstance(subagents, dict):
+        subagents = list(subagents.values())
+    if isinstance(subagents, list):
+        inactive_states = {
+            "idle", "done", "finished", "completed", "killed", 
+            "canceled", "cancelled", "errored", "error", "terminated", "closed"
+        }
+        for s in subagents:
+            if isinstance(s, dict):
+                st = str(
+                    s.get("agent_state") or 
+                    s.get("state") or 
+                    s.get("status") or 
+                    s.get("lifecycle") or 
+                    ""
+                ).strip().lower()
+                if st in inactive_states:
+                    continue
+                active_subs += 1
+            elif s:
+                active_subs += 1
+    elif "active_subagents_count" in data:
+        active_subs = safe_int(data.get("active_subagents_count"), 0)
+
+    # 2. 检查是否有运行中的后台任务（如 background_tasks / tasks）
+    running_tasks = 0
+    tasks = data.get("background_tasks") or data.get("tasks")
+    if isinstance(tasks, dict):
+        tasks = list(tasks.values())
+    if isinstance(tasks, list):
+        for t in tasks:
+            if isinstance(t, dict):
+                st = str(t.get("status") or t.get("state") or "").strip().lower()
+                if st in ("running", "active", "executing"):
+                    running_tasks += 1
+
+    # 3. 活跃判定：只要主模型在 working，或有活跃 subagent，或有后台任务在跑，均为活跃干活状态
+    is_active = (curr_state == "working") or (active_subs > 0) or (running_tasks > 0)
+    return is_active, active_subs
+
+
 # ── Metrics Tracker ────────────────────────────────────────────────────────────
 class SessionMetricsTracker:
     def __init__(self, state_file: str):
@@ -560,6 +619,7 @@ class SessionMetricsTracker:
         self.current_execution_start = 0.0
         self.current_start_tokens = 0
         self.last_state = "idle"
+        self.active_subagents_count = 0
         self._load()
 
     def _load(self):
@@ -574,6 +634,7 @@ class SessionMetricsTracker:
                     self.current_execution_start = safe_float(d.get("current_execution_start"), 0.0)
                     self.current_start_tokens = safe_int(d.get("current_start_tokens"), 0)
                     self.last_state = str(d.get("last_state") or "idle")
+                    self.active_subagents_count = safe_int(d.get("active_subagents_count"), 0)
         except Exception:
             pass
 
@@ -593,6 +654,7 @@ class SessionMetricsTracker:
             state["current_execution_start"] = self.current_execution_start
             state["current_start_tokens"] = self.current_start_tokens
             state["last_state"] = self.last_state
+            state["active_subagents_count"] = self.active_subagents_count
             with open(self.state_file, "w") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
         except Exception:
@@ -604,7 +666,9 @@ class SessionMetricsTracker:
 
         now = time.time()
         sid = str(data.get("session_id") or data.get("conversation_id") or "")
-        curr_state = str(data.get("agent_state") or "idle")
+        is_active, active_subs = check_activity(data)
+        self.active_subagents_count = active_subs
+
         cw = data.get("context_window") or {}
         if not isinstance(cw, dict):
             cw = {}
@@ -616,56 +680,60 @@ class SessionMetricsTracker:
             self.total_active_time = 0.0
             self.last_step_time = 0.0
             self.last_tps = 0.0
-            self.current_execution_start = 0.0
+            self.current_execution_start = now if is_active else 0.0
             self.current_start_tokens = curr_out_tokens
-            self.last_state = curr_state
+            self.last_state = "working" if is_active else "idle"
             self._save()
             return
 
         # 2. 状态机流转与执行时间精确结算：
-        if curr_state == "working":
-            # 刚进入 working（或首次记录）：标记本次执行开始
+        if is_active:
+            # 刚进入活跃干活（或首次记录）：标记本次执行开始（“第一个启动”）
             if self.current_execution_start <= 0.0:
                 self.current_execution_start = now
                 self.current_start_tokens = curr_out_tokens
                 self._save()
             else:
-                # 仍在 working 中执行，更新实时速率
+                # 仍在活跃执行中，更新实时速率
                 cur_dur = max(0.1, now - self.current_execution_start)
                 delta_tokens = max(0, curr_out_tokens - self.current_start_tokens)
                 if delta_tokens > 0:
                     self.last_tps = delta_tokens / cur_dur
 
-        elif curr_state == "idle":
-            # 刚从 working 变为 idle，或者有未结算的执行周期：
+        else:
+            # 当前完全空闲（“最后一个结束”）：
             if self.current_execution_start > 0.0:
-                # 计算本次执行的实际耗时
+                # 计算从第一个启动到最后一个结束的真实物理耗时
                 final_dur = max(0.1, now - self.current_execution_start)
-                delta_tokens = max(0, curr_out_tokens - self.current_start_tokens)
-                if delta_tokens > 0:
-                    self.last_tps = delta_tokens / final_dur
 
-                # 【核心】：将本次执行开始到结束的实际耗时，累加到总时间上去！
-                self.total_active_time += final_dur
-                self.last_step_time = final_dur
-                self.current_execution_start = 0.0  # 结算完成，清零当前轮开始时间
+                # 防异常跨度（例如休眠/跨天重开导致时间异常虚高，超过 4 小时则丢弃）
+                if final_dur < 14400.0:
+                    delta_tokens = max(0, curr_out_tokens - self.current_start_tokens)
+                    if delta_tokens > 0:
+                        self.last_tps = delta_tokens / final_dur
+
+                    # 【核心】：将物理耗时累计到总时间上去！
+                    self.total_active_time += final_dur
+                    self.last_step_time = final_dur
+
+                self.current_execution_start = 0.0  # 结算完成，清零本轮开始时间
                 self._save()
 
-        self.last_state = curr_state
+        self.last_state = "working" if is_active else "idle"
 
-    def get_metrics(self, curr_state: str) -> tuple[float, float, float, bool]:
+    def get_metrics(self, is_active: bool, active_subs: int = 0) -> tuple[float, float, float, bool, int]:
         now = time.time()
-        is_working = (curr_state == "working" and self.current_execution_start > 0.0)
+        is_working = (is_active and self.current_execution_start > 0.0)
 
         if is_working:
             # 执行中：本次耗时 = 当前已走过的秒数
             cur_step_time = max(0.1, now - self.current_execution_start)
             # 执行中总时间 = 历史已结算总时间 + 本轮正在进行的秒数
             total_time = self.total_active_time + cur_step_time
-            return total_time, cur_step_time, self.last_tps, True
+            return total_time, cur_step_time, self.last_tps, True, active_subs
         else:
             # 空闲时：显示历史已结算总时间，以及上一轮结算的真实耗时与速率
-            return self.total_active_time, self.last_step_time, self.last_tps, False
+            return self.total_active_time, self.last_step_time, self.last_tps, False, 0
 
 
 metrics_tracker = SessionMetricsTracker(STATUS_STATE_FILE)
@@ -735,9 +803,9 @@ def _render_internal(data: dict) -> str:
 
     # 7. 会话总时间 / 每次模型执行的时间
     try:
-        agent_st = str(data.get("agent_state") or "idle")
-        session_sec, model_sec, tps, is_working = metrics_tracker.get_metrics(agent_st)
-        time_str = f"{format_session_time(session_sec)}/{format_model_time(model_sec, is_working)}"
+        is_active, active_subs = check_activity(data)
+        session_sec, model_sec, tps, is_working, num_subs = metrics_tracker.get_metrics(is_active, active_subs)
+        time_str = f"{format_session_time(session_sec)}/{format_model_time(model_sec, is_working, num_subs)}"
         time_display = f"{CYAN}{time_str}{RESET}"
         tps_str = format_tps(tps)
         tps_display = f"{LIGHT_ORANGE}{tps_str}{RESET}"
