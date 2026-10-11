@@ -519,8 +519,11 @@ def format_seconds(sec: int) -> str:
     return f"{hours}h {mins}m" if mins else f"{hours}h"
 
 
-def format_session_time(sec: float) -> str:
+def format_duration(sec: float, include_tenths_under_60: bool = False) -> str:
     sec = safe_float(sec, 0.0)
+    if include_tenths_under_60 and sec < 59.95:
+        return f"{sec:.1f}s"
+
     s = int(round(max(0, sec)))
     if s < 60:
         return f"{s}s"
@@ -531,6 +534,10 @@ def format_session_time(sec: float) -> str:
     return f"{hours}h{mins_rem:02d}m"
 
 
+def format_session_time(sec: float) -> str:
+    return format_duration(sec, include_tenths_under_60=False)
+
+
 def format_model_time(sec: float, is_working: bool = False, active_subs: int = 0) -> str:
     sec = safe_float(sec, 0.0)
     if is_working:
@@ -538,13 +545,12 @@ def format_model_time(sec: float, is_working: bool = False, active_subs: int = 0
         if active_subs > 0:
             badge_text = f"({active_subs} sub)" if active_subs == 1 else f"({active_subs} subs)"
             sub_badge = f" {MAGENTA}{badge_text}{CYAN}"
-        return f"⏱️ {sec:.1f}s{sub_badge}"
+        dur_str = format_duration(sec, include_tenths_under_60=True)
+        return f"⏱️ {dur_str}{sub_badge}"
+
     if sec <= 0:
         return "-"
-    if sec < 60:
-        return f"{sec:.1f}s"
-    mins, sec_rem = divmod(int(round(sec)), 60)
-    return f"{mins}m{sec_rem:02d}s"
+    return format_duration(sec, include_tenths_under_60=True)
 
 
 def format_tps(tps: float) -> str:
