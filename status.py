@@ -13,6 +13,8 @@ import re
 import subprocess
 import http.client
 import ssl
+import shutil
+import unicodedata
 from datetime import datetime, timezone
 import traceback
 
@@ -364,6 +366,7 @@ def write_status_state(data: dict) -> None:
         else:
             state["model"] = str(model_info or "")
         state["timestamp"] = time.time()
+
         
         # 保留指标计时字段
         for k in (
@@ -490,6 +493,14 @@ def get_tip(force_rotate=False) -> str:
 
 
 # ── Rendering ──────────────────────────────────────────────────────────────────
+
+def visible_len(s: str) -> int:
+    no_ansi = re.sub(r"\033\[[0-9;]*[a-zA-Z]", "", s)
+    w = 0
+    for ch in no_ansi:
+        w += 2 if unicodedata.east_asian_width(ch) in ("F", "W") else 1
+    return w
+
 SEP = f" {GRAY}|{RESET} "
 
 
@@ -546,7 +557,7 @@ def format_model_time(sec: float, is_working: bool = False, active_subs: int = 0
             badge_text = f"({active_subs} sub)" if active_subs == 1 else f"({active_subs} subs)"
             sub_badge = f" {MAGENTA}{badge_text}{CYAN}"
         dur_str = format_duration(sec, include_tenths_under_60=True)
-        return f"⏱️ {dur_str}{sub_badge}"
+        return f"⏱ {dur_str}{sub_badge}"
 
     if sec <= 0:
         return "-"
@@ -757,6 +768,72 @@ def render(data: dict) -> str:
         return f"{RED}⚠️ 状态栏异常 [{err_type}: {err_msg}]{RESET} · 详见 status-error.log {GRAY}|{RESET} {GREEN}dir:{dir_name}{RESET}"
 
 
+def resolve_quota_for_model(model_name: str, quota_dict: dict) -> tuple[dict, dict]:
+    if not isinstance(quota_dict, dict) or not quota_dict:
+        return {}, {}
+
+    m_lower = model_name.lower()
+    is_argon = "argon" in m_lower
+    is_3p = any(x in m_lower for x in ["claude", "gpt", "o1", "o3", "deepseek"])
+
+    # 1. 匹配长期/周限制配额 (统一对外标签为 Week)
+    q_long = None
+    if is_argon:
+        for k, v in quota_dict.items():
+            if "argon" in k and ("week" in k or "wtu" in k):
+                q_long = v
+                break
+        if not q_long:
+            q_long = quota_dict.get("gemini-argon-wtu-weekly")
+    elif is_3p:
+        for k, v in quota_dict.items():
+            if ("3p" in k or "claude" in k or "gpt" in k) and "week" in k:
+                q_long = v
+                break
+        if not q_long:
+            q_long = quota_dict.get("3p-weekly")
+
+    if not q_long:
+        q_long = quota_dict.get("gemini-weekly")
+        for k, v in quota_dict.items():
+            if "week" in k and "3p" not in k and "argon" not in k:
+                q_long = v
+                break
+
+    # 2. 匹配短期 5小时限制配额
+    q_short = None
+    if is_argon:
+        for k, v in quota_dict.items():
+            if "argon" in k and "5h" in k:
+                q_short = v
+                break
+        if not q_short:
+            q_short = quota_dict.get("gemini-5h")
+    elif is_3p:
+        q_short = quota_dict.get("3p-5h")
+        if not q_short:
+            for k, v in quota_dict.items():
+                if ("3p" in k or "claude" in k) and "5h" in k:
+                    q_short = v
+                    break
+    else:
+        q_short = quota_dict.get("gemini-5h")
+
+    if not q_short:
+        for k, v in quota_dict.items():
+            if "5h" in k and not v.get("disabled"):
+                q_short = v
+                break
+
+    if not q_long:
+        for k, v in quota_dict.items():
+            if "week" in k and not v.get("disabled"):
+                q_long = v
+                break
+
+    return q_short or {}, q_long or {}
+
+
 def _render_internal(data: dict) -> str:
     if not isinstance(data, dict):
         data = {}
@@ -782,8 +859,8 @@ def _render_internal(data: dict) -> str:
         model_name = "AGY"
     model_display = f"{YELLOW}{BOLD}{model_name}{RESET}"
 
-    # 3. 当前目录：dir:webSite8gc3
-    cwd = data.get("cwd") or data.get("current_dir") or data.get("project_dir") or ""
+    # 3. 当前目录：dir:test
+    cwd = data.get("cwd") or data.get("current_dir") or data.get("project_dir") or (data.get("workspace") or {}).get("current_dir") or (data.get("workspace") or {}).get("project_dir") or ""
     dir_name = os.path.basename(str(cwd).rstrip("/")) or str(cwd) or "workspace"
     dir_display = f"{GREEN}dir:{dir_name}{RESET}"
 
@@ -825,13 +902,8 @@ def _render_internal(data: dict) -> str:
         quota_dict = data.get("quota") or {}
         if not isinstance(quota_dict, dict):
             quota_dict = {}
-        m_lower = model_name.lower()
-        is_3p = any(x in m_lower for x in ["claude", "gpt", "o1", "o3", "deepseek"])
-        target_5h = "3p-5h" if is_3p else "gemini-5h"
-        target_week = "3p-weekly" if is_3p else "gemini-weekly"
 
-        q_5h = quota_dict.get(target_5h) or quota_dict.get("gemini-5h")
-        q_week = quota_dict.get(target_week) or quota_dict.get("gemini-weekly")
+        q_5h, q_week = resolve_quota_for_model(model_name, quota_dict)
 
         if isinstance(q_5h, dict) and "remaining_fraction" in q_5h:
             pct_5h = int(round(safe_float(q_5h.get("remaining_fraction")) * 100))
@@ -839,7 +911,7 @@ def _render_internal(data: dict) -> str:
             reset_sec_5h = safe_int(q_5h.get("reset_in_seconds"), 0)
             reset_5h_str = f" · reset {format_seconds(reset_sec_5h)}" if reset_sec_5h > 0 else ""
 
-            # 周限制 (Weekly)
+            # 周限制统一命名为 Week
             week_str = ""
             if isinstance(q_week, dict) and "remaining_fraction" in q_week:
                 pct_week = int(round(safe_float(q_week.get("remaining_fraction")) * 100))
@@ -864,17 +936,50 @@ def _render_internal(data: dict) -> str:
         record_error(e, data)
         quota_display = f"{GRAY}Quota: sync /usage{RESET}"
 
-    # 组合为单行状态栏：将模型与 Quota（含周限制）移至最后
-    return (
-        f"{dir_display}{SEP}"
-        f"{tokens_io}{SEP}"
-        f"{tok_display}{SEP}"
-        f"{ctx_ratio_display}{SEP}"
-        f"{time_display}{SEP}"
-        f"{tps_display}{SEP}"
-        f"{model_display}{SEP}"
-        f"{quota_display}"
-    )
+    # 终端宽度自适应（核心防折行）：
+    term_width = safe_int(data.get("terminal_width"), 0)
+    if term_width <= 0:
+        term_width = shutil.get_terminal_size((120, 24)).columns
+    max_w = max(40, term_width - 1)
+
+    parts = [
+        dir_display,
+        tokens_io,
+        tok_display,
+        ctx_ratio_display,
+        time_display,
+        tps_display,
+        model_display,
+        quota_display,
+    ]
+    line = SEP.join([p for p in parts if p])
+
+    # 如果超长，逐级自适应裁切非核心信息以严防折行：
+    if visible_len(line) > max_w and " · Week:" in quota_display:
+        quota_display = quota_display.split(" · Week:")[0]
+        parts[7] = quota_display
+        line = SEP.join([p for p in parts if p])
+
+    if visible_len(line) > max_w and " · reset" in quota_display:
+        quota_display = quota_display.split(" · reset")[0]
+        parts[7] = quota_display
+        line = SEP.join([p for p in parts if p])
+
+    if visible_len(line) > max_w:
+        parts[5] = ""  # 省略 tps
+        line = SEP.join([p for p in parts if p])
+
+    if visible_len(line) > max_w:
+        parts[1] = ""  # 省略 ↑0 ↓0
+        line = SEP.join([p for p in parts if p])
+
+    if visible_len(line) > max_w:
+        # 简化模型名 (去掉括号)
+        short_model = model_name.split("(")[0].strip()
+        parts[6] = f"{YELLOW}{BOLD}{short_model}{RESET}"
+        line = SEP.join([p for p in parts if p])
+
+    return line
 
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
@@ -882,25 +987,21 @@ def _main_internal():
     if sys.stdin.isatty():
         state = read_json_file(STATUS_STATE_FILE)
         if state:
-            print(render(state), flush=True)
+            sys.stdout.write(render(state))
+            sys.stdout.flush()
         return
 
     decoder = json.JSONDecoder()
     buffer = ""
     last_data = None
-    has_printed = False
     fd = sys.stdin.fileno()
 
     while True:
         try:
-            r, _, _ = select.select([sys.stdin], [], [], 0.5)
+            r, _, _ = select.select([sys.stdin], [], [], 0.3)
             if r:
                 chunk = os.read(fd, 65536).decode("utf-8", "replace")
                 if not chunk:
-                    # 管道写入端关闭（EOF）：如果此前尚未输出过，在此输出一次；否则直接退出
-                    if not has_printed and last_data:
-                        print(render(last_data), flush=True)
-                        has_printed = True
                     break
                 buffer += chunk
                 while buffer:
@@ -914,15 +1015,12 @@ def _main_internal():
                         if isinstance(data, dict):
                             write_status_state(data)
                             last_data = data
-                            print(render(last_data), flush=True)
-                            has_printed = True
                     except json.JSONDecodeError:
                         break
             else:
-                # 孤儿进程保护：父进程退出时立即终止
                 if os.getppid() == 1:
                     break
-                if last_data and has_printed:
+                if last_data:
                     break
         except (EOFError, KeyboardInterrupt):
             break
@@ -930,25 +1028,42 @@ def _main_internal():
             record_error(e, buffer)
             break
 
-    if not has_printed:
-        if last_data:
-            print(render(last_data), flush=True)
+    # 严格单行输出，末尾不产生多余换行符
+    if last_data:
+        out_line = render(last_data)
+    else:
+        state = read_json_file(STATUS_STATE_FILE)
+        if state:
+            out_line = render(state)
         else:
-            state = read_json_file(STATUS_STATE_FILE)
-            if state:
-                print(render(state), flush=True)
-            else:
-                print(f"{GRAY}dir:workspace | ↑0 ↓0 | 0 tok | 0%/auto | -/- | - t/s | AGY | Quota: sync /usage{RESET}", flush=True)
+            out_line = f"{GRAY}dir:workspace | ↑0 ↓0 | 0 tok | 0%/auto | -/- | - t/s | AGY | Quota: sync /usage{RESET}"
+
+    clean_line = out_line.rstrip("\r\n")
+    try:
+        sys.stdout.write(clean_line)
+        sys.stdout.flush()
+    except (BrokenPipeError, IOError):
+        pass
 
 
 def main():
     try:
         _main_internal()
+    except (BrokenPipeError, IOError):
+        # 管道写入端/父进程提前关闭输出管道，属于标准 Unix CLI 行为，静默退出
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except Exception:
+            pass
+        sys.exit(0)
     except Exception as e:
         record_error(e, None)
-        # 顶级兜底：以 Exit 0 退出并打印错误信息，确保 agy 不会因为连续失败而自动禁用 statusline
         err_type = type(e).__name__
-        print(f"{RED}⚠️ 状态栏故障 [{err_type}: {str(e)[:40]}]{RESET} · 详见 status-error.log", flush=True)
+        try:
+            print(f"{RED}⚠️ 状态栏故障 [{err_type}: {str(e)[:40]}]{RESET} · 详见 status-error.log", flush=True)
+        except Exception:
+            pass
         sys.exit(0)
 
 
